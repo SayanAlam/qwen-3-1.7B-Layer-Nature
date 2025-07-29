@@ -4,7 +4,8 @@ import gc
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+
 
 # === Load local model ===
 model_path = "/home/uom/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/0060bc56d46589041c1048efd1a397421b1142b5"
@@ -203,12 +204,17 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
     else:
         hook = None
 
+    generation_config = GenerationConfig(
+    max_new_tokens=max_new_tokens,
+    do_sample=False,
+    use_cache=false,
+)
+
     output_ids = model.generate(
         **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        use_cache=True,
+        generation_config=generation_config,
     )[0]
+
 
     if hook: hook.remove()
 
