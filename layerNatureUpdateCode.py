@@ -207,7 +207,7 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
     generation_config = GenerationConfig(
     max_new_tokens=max_new_tokens,
     do_sample=False,
-    use_cache=false,
+    use_cache=False,
 )
 
     output_ids = model.generate(
