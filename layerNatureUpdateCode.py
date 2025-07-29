@@ -24,6 +24,11 @@ set_seed(42)
 # === Load local model ===
 model_path = "/home/uom/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/0060bc56d46589041c1048efd1a397421b1142b5"
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+# Set pad token if not available
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
 model = AutoModelForCausalLM.from_pretrained(
     model_path, 
     trust_remote_code=True, 
@@ -31,6 +36,16 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 model.eval()
+
+# Print model's default generation config to understand what's being overridden
+print("Model's default generation config:")
+if hasattr(model, 'generation_config'):
+    print(f"do_sample: {model.generation_config.do_sample}")
+    print(f"temperature: {model.generation_config.temperature}")
+    print(f"top_k: {model.generation_config.top_k}")
+    print(f"top_p: {model.generation_config.top_p}")
+    print(f"bos_token_id: {model.generation_config.bos_token_id}")
+    print("="*50)
 
 # Ensure model is in eval mode and disable dropout
 for module in model.modules():
@@ -230,22 +245,38 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
         
         hook = model.model.layers[layer_to_ablate].register_forward_hook(ablation_hook)
 
+    # Create deterministic generation config - explicitly override ALL defaults
     generation_config = GenerationConfig(
         max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=1.0,
-        top_p=1.0,
-        top_k=50,
+        do_sample=False,  # Force deterministic generation
+        temperature=None,  # Not used when do_sample=False
+        top_p=None,       # Not used when do_sample=False
+        top_k=None,       # Not used when do_sample=False
         use_cache=False,
-        pad_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
+        repetition_penalty=1.0,
+        length_penalty=1.0,
+        num_beams=1,  # Greedy decoding
     )
     
-    # Generate with consistent settings
+    # Generate with explicit parameters to avoid warnings
     with torch.no_grad():
         output_ids = model.generate(
-            **inputs,
-            generation_config=generation_config,
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=1.0,  # Will be ignored since do_sample=False
+            top_k=None,
+            top_p=None,
+            use_cache=False,
+            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            num_beams=1,
+            repetition_penalty=1.0,
+            length_penalty=1.0,
             return_dict_in_generate=False
         )[0]
 
