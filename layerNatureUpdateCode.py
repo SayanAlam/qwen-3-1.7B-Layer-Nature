@@ -3,17 +3,39 @@ import torch.nn as nn
 import gc
 import pandas as pd
 import numpy as np
+import random
+import os
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+# === Set seeds for reproducibility ===
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_seed(42)
 
 # === Load local model ===
 model_path = "/home/uom/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/0060bc56d46589041c1048efd1a397421b1142b5"
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
-    model_path, trust_remote_code=True, torch_dtype=torch.float16, device_map="auto"
+    model_path, 
+    trust_remote_code=True, 
+    torch_dtype=torch.float16, 
+    device_map="auto"
 )
 model.eval()
+
+# Ensure model is in eval mode and disable dropout
+for module in model.modules():
+    if hasattr(module, 'training'):
+        module.training = False
 
 # === Prompt Sets ===
 instruction_prompts = [
@@ -194,72 +216,116 @@ instruction_prompts=instruction_prompts[:10]
 # === Get model output tokens ===
 @torch.no_grad()
 def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # Clear cache before each generation
+    torch.cuda.empty_cache()
+    
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    
+    hook = None
     if layer_to_ablate is not None:
         def ablation_hook(module, input, output):
             if isinstance(output, tuple):
                 return tuple(torch.zeros_like(o) for o in output)
             return torch.zeros_like(output)
-
+        
         hook = model.model.layers[layer_to_ablate].register_forward_hook(ablation_hook)
-    else:
-        hook = None
 
     generation_config = GenerationConfig(
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=50,
         use_cache=False,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
     )
-    output_ids = model.generate(
-        **inputs,
-        generation_config=generation_config
-    )[0]
+    
+    # Generate with consistent settings
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            generation_config=generation_config,
+            return_dict_in_generate=False
+        )[0]
 
-
-
-
-    if hook: hook.remove()
+    if hook: 
+        hook.remove()
 
     decoded = tokenizer.decode(output_ids, skip_special_tokens=True)
     return decoded
 
 # === Get sentence embedding ===
+@torch.no_grad()
 def get_embedding(text):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=30).to(model.device)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(model.device)
+    
     with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True)
-    return outputs.hidden_states[-1][:, -1, :].squeeze().float()
+        outputs = model(**inputs, output_hidden_states=True, use_cache=False)
+    
+    # Use mean pooling instead of last token for more stable embeddings
+    hidden_states = outputs.hidden_states[-1]
+    attention_mask = inputs['attention_mask'].unsqueeze(-1)
+    masked_embeddings = hidden_states * attention_mask
+    embeddings = masked_embeddings.sum(dim=1) / attention_mask.sum(dim=1)
+    
+    return embeddings.squeeze().float()
 
 # === Cosine similarity between outputs ===
 def cosine_similarity(a, b):
-    return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+    # Normalize vectors to avoid numerical issues
+    a_norm = torch.nn.functional.normalize(a, p=2, dim=0)
+    b_norm = torch.nn.functional.normalize(b, p=2, dim=0)
+    return torch.nn.functional.cosine_similarity(a_norm, b_norm, dim=0).item()
 
-# === Layer-wise Analysis ===
-def analyze_layer_behavior(prompt_set, label, max_new_tokens=30):
+# === Layer-wise Analysis with multiple runs for stability ===
+def analyze_layer_behavior(prompt_set, label, max_new_tokens=30, num_runs=3):
     num_layers = len(model.model.layers)
     impact_scores = []
 
     for layer in tqdm(range(num_layers), desc=f"{label} Layer Ablation"):
-        delta_total = 0
-        for prompt in prompt_set:
-            original = generate_tokens(prompt, None, max_new_tokens)
-            ablated = generate_tokens(prompt, layer_to_ablate=layer, max_new_tokens=max_new_tokens)
+        run_scores = []
+        
+        # Multiple runs for each layer to get more stable results
+        for run in range(num_runs):
+            set_seed(42 + run)  # Different seed for each run
+            delta_total = 0
+            
+            for prompt in prompt_set:
+                # Generate original and ablated outputs
+                original = generate_tokens(prompt, None, max_new_tokens)
+                ablated = generate_tokens(prompt, layer_to_ablate=layer, max_new_tokens=max_new_tokens)
 
-            orig_emb = get_embedding(original)
-            ablt_emb = get_embedding(ablated)
-            delta = 1 - cosine_similarity(orig_emb, ablt_emb)
-            delta_total += delta
+                # Get embeddings
+                orig_emb = get_embedding(original)
+                ablt_emb = get_embedding(ablated)
+                
+                # Calculate dissimilarity
+                similarity = cosine_similarity(orig_emb, ablt_emb)
+                delta = 1 - similarity
+                delta_total += delta
 
-        avg_delta = delta_total / len(prompt_set)
-        impact_scores.append(avg_delta)
+            avg_delta = delta_total / len(prompt_set)
+            run_scores.append(avg_delta)
+            
+            # Clean up after each run
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Take median across runs for stability
+        final_score = np.median(run_scores)
+        impact_scores.append(final_score)
+        
+        print(f"Layer {layer}: {final_score:.4f} (std: {np.std(run_scores):.4f})")
 
     return impact_scores
 
-# === Run for both categories ===
+# === Main execution ===
+print("Starting analysis...")
+print("Analyzing instruction prompts...")
 instruction_scores = analyze_layer_behavior(instruction_prompts, "Instruction", max_new_tokens=30)
+
+print("\nAnalyzing reasoning prompts...")
 reasoning_scores = analyze_layer_behavior(reasoning_prompts, "Reasoning", max_new_tokens=30)
 
 # === Create output table ===
@@ -279,9 +345,22 @@ df = pd.DataFrame({
 df["Instruction_Impact"] = df["Instruction_Impact"].round(4)
 df["Reasoning_Impact"] = df["Reasoning_Impact"].round(4)
 df["Δ (Reason - Instr)"] = df["Δ (Reason - Instr)"].round(4)
+
+print("\n" + "="*80)
+print("FINAL RESULTS")
+print("="*80)
 print(df.to_string(index=False))
 
-# === Save to .txt file ===
+# === Save to files ===
+df.to_csv("layer_behavior_analysis.csv", index=False)
 with open("layer_behavior_table.txt", "w") as f:
+    f.write("Qwen 3 1.7B Layer Analysis Results\n")
+    f.write("="*50 + "\n\n")
     f.write(df.to_string(index=False))
+    f.write("\n\nAnalysis Summary:\n")
+    f.write(f"Total layers: {len(instruction_scores)}\n")
+    f.write(f"Reasoning-dominant layers: {sum(1 for x in df['Layer_Nature'] if x == 'Reasoning')}\n")
+    f.write(f"Instruction-dominant layers: {sum(1 for x in df['Layer_Nature'] if x == 'Instruction')}\n")
+    f.write(f"Neutral layers: {sum(1 for x in df['Layer_Nature'] if x == 'Neutral')}\n")
 
+print(f"\nResults saved to 'layer_behavior_analysis.csv' and 'layer_behavior_table.txt'")
