@@ -205,21 +205,19 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
     else:
         hook = None
 
-    generation_config = GenerationConfig(
+    output_ids = model.generate(
+        **inputs,
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        use_cache=False,
         temperature=1.0,
         top_p=1.0,
-        use_cache=False,
+        top_k=0,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-    )
-
-    output_ids = model.generate(
-        **inputs,
-        generation_config=generation_config,
     )[0]
+
 
 
     if hook: hook.remove()
