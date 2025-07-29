@@ -209,13 +209,13 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
     max_new_tokens=max_new_tokens,
     do_sample=False,
     temperature=1.0,
-    top_k=0,
     top_p=1.0,
     use_cache=False,
     pad_token_id=tokenizer.pad_token_id,
     bos_token_id=tokenizer.bos_token_id,
     eos_token_id=tokenizer.eos_token_id,
 )
+
 
 
     output_ids = model.generate(
