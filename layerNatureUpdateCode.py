@@ -245,8 +245,8 @@ reasoning_prompts = [
     "Find the number of trailing zeros in 100!",
 ]
 
-reasoning_prompts=reasoning_prompts[:10]
-instruction_prompts=instruction_prompts[:10]
+reasoning_prompts=reasoning_prompts[:5]
+instruction_prompts=instruction_prompts[:5]
 
 # === Get model output tokens ===
 @torch.no_grad()
@@ -265,14 +265,29 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
         
         hook = model.model.layers[layer_to_ablate].register_forward_hook(ablation_hook)
 
-    # Use the model's updated generation config (which we set to deterministic)
-    # Just override max_new_tokens since we already set the model config
+    # VERIFY: Print generation config being used (only for first call)
+    if not hasattr(generate_tokens, '_config_verified'):
+        print(f"\nVERIFYING GENERATION CONFIG:")
+        print(f"Model config - do_sample: {model.generation_config.do_sample}")
+        print(f"Model config - temperature: {model.generation_config.temperature}")
+        print(f"Model config - use_cache: {model.generation_config.use_cache}")
+        generate_tokens._config_verified = True
+
+    # Force deterministic parameters explicitly in the generate call
     with torch.no_grad():
         output_ids = model.generate(
             input_ids=inputs['input_ids'],
             attention_mask=inputs['attention_mask'],
             max_new_tokens=max_new_tokens,
-            # No need to specify other params since we updated model.generation_config
+            do_sample=False,  # EXPLICITLY FORCE THIS
+            temperature=1.0,
+            top_k=None,
+            top_p=None,
+            use_cache=False,
+            num_beams=1,
+            early_stopping=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
     if hook: 
@@ -317,10 +332,16 @@ def analyze_layer_behavior(prompt_set, label, max_new_tokens=30, num_runs=3):
             set_seed(42 + run)  # Different seed for each run
             delta_total = 0
             
-            for prompt in prompt_set:
+            for i, prompt in enumerate(prompt_set):
                 # Generate original and ablated outputs
                 original = generate_tokens(prompt, None, max_new_tokens)
                 ablated = generate_tokens(prompt, layer_to_ablate=layer, max_new_tokens=max_new_tokens)
+
+                # Debug: Print first few examples for layer 0 and a middle layer
+                if layer in [0, num_layers//2] and run == 0 and i == 0:
+                    print(f"\n--- DEBUG: Layer {layer}, Prompt {i+1} ---")
+                    print(f"Original: {original[:100]}...")
+                    print(f"Ablated:  {ablated[:100]}...")
 
                 # Get embeddings
                 orig_emb = get_embedding(original)
@@ -330,6 +351,10 @@ def analyze_layer_behavior(prompt_set, label, max_new_tokens=30, num_runs=3):
                 similarity = cosine_similarity(orig_emb, ablt_emb)
                 delta = 1 - similarity
                 delta_total += delta
+                
+                # Debug: Print similarity for first prompt
+                if layer in [0, num_layers//2] and run == 0 and i == 0:
+                    print(f"Similarity: {similarity:.4f}, Delta: {delta:.4f}")
 
             avg_delta = delta_total / len(prompt_set)
             run_scores.append(avg_delta)
@@ -342,9 +367,39 @@ def analyze_layer_behavior(prompt_set, label, max_new_tokens=30, num_runs=3):
         final_score = np.median(run_scores)
         impact_scores.append(final_score)
         
-        print(f"Layer {layer}: {final_score:.4f} (std: {np.std(run_scores):.4f})")
+        print(f"Layer {layer}: {final_score:.4f} (std: {np.std(run_scores):.4f}) - Range: [{min(run_scores):.4f}, {max(run_scores):.4f}]")
 
     return impact_scores
+
+# === Test deterministic behavior ===
+def test_deterministic_generation():
+    print("\n" + "="*60)
+    print("TESTING DETERMINISTIC BEHAVIOR")
+    print("="*60)
+    
+    test_prompt = "The capital of France is"
+    print(f"Test prompt: '{test_prompt}'")
+    print("\nGenerating same prompt 3 times to verify determinism:")
+    
+    # Set seed and generate multiple times
+    outputs = []
+    for i in range(3):
+        set_seed(42)  # Same seed each time
+        output = generate_tokens(test_prompt, max_new_tokens=10)
+        outputs.append(output)
+        print(f"Generation {i+1}: {output}")
+    
+    # Check if all outputs are identical
+    all_same = all(output == outputs[0] for output in outputs)
+    print(f"\nAll outputs identical: {all_same}")
+    
+    if not all_same:
+        print("❌ WARNING: Generation is NOT deterministic!")
+        print("This will cause inconsistent layer analysis results.")
+    else:
+        print("✅ Generation is deterministic - good!")
+    
+    print("="*60)
 
 # === Main execution ===
 print("Starting analysis...")
@@ -356,13 +411,31 @@ reasoning_scores = analyze_layer_behavior(reasoning_prompts, "Reasoning", max_ne
 
 # === Create output table ===
 layer_ids = list(range(len(instruction_scores)))
+
+# Calculate statistics for better threshold setting
+instr_mean = np.mean(instruction_scores)
+reason_mean = np.mean(reasoning_scores)
+diff_scores = [r - i for r, i in zip(reasoning_scores, instruction_scores)]
+diff_std = np.std(diff_scores)
+diff_mean = np.mean(diff_scores)
+
+print(f"\nStatistics:")
+print(f"Instruction Impact - Mean: {instr_mean:.4f}, Std: {np.std(instruction_scores):.4f}")
+print(f"Reasoning Impact - Mean: {reason_mean:.4f}, Std: {np.std(reasoning_scores):.4f}")
+print(f"Difference (R-I) - Mean: {diff_mean:.4f}, Std: {diff_std:.4f}")
+print(f"Suggested threshold: {diff_std:.4f} (1 std dev)")
+
+# Use adaptive threshold based on standard deviation
+adaptive_threshold = max(0.01, diff_std * 0.5)  # At least 0.01, or half std dev
+print(f"Using threshold: {adaptive_threshold:.4f}")
+
 df = pd.DataFrame({
     "Layer": layer_ids,
     "Instruction_Impact": instruction_scores,
     "Reasoning_Impact": reasoning_scores,
-    "Δ (Reason - Instr)": [r - i for r, i in zip(reasoning_scores, instruction_scores)],
+    "Δ (Reason - Instr)": diff_scores,
     "Layer_Nature": [
-        "Reasoning" if r - i > 0.02 else "Instruction" if i - r > 0.02 else "Neutral"
+        "Reasoning" if r - i > adaptive_threshold else "Instruction" if i - r > adaptive_threshold else "Neutral"
         for i, r in zip(instruction_scores, reasoning_scores)
     ]
 })
@@ -390,3 +463,4 @@ with open("layer_behavior_table.txt", "w") as f:
     f.write(f"Neutral layers: {sum(1 for x in df['Layer_Nature'] if x == 'Neutral')}\n")
 
 print(f"\nResults saved to 'layer_behavior_analysis.csv' and 'layer_behavior_table.txt'")
+
