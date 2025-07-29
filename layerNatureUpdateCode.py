@@ -37,14 +37,34 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.eval()
 
-# Print model's default generation config to understand what's being overridden
-print("Model's default generation config:")
+# Print original model's default generation config
+print("Original model's default generation config:")
 if hasattr(model, 'generation_config'):
     print(f"do_sample: {model.generation_config.do_sample}")
     print(f"temperature: {model.generation_config.temperature}")
     print(f"top_k: {model.generation_config.top_k}")
     print(f"top_p: {model.generation_config.top_p}")
     print(f"bos_token_id: {model.generation_config.bos_token_id}")
+
+# Override model's generation config for deterministic behavior
+print("\nOverriding model's generation config for deterministic behavior...")
+if hasattr(model, 'generation_config'):
+    model.generation_config.do_sample = False
+    model.generation_config.temperature = 1.0
+    model.generation_config.top_k = None
+    model.generation_config.top_p = None
+    model.generation_config.use_cache = False
+    model.generation_config.repetition_penalty = 1.0
+    model.generation_config.length_penalty = 1.0
+    model.generation_config.num_beams = 1
+
+print("Updated model's generation config:")
+if hasattr(model, 'generation_config'):
+    print(f"do_sample: {model.generation_config.do_sample}")
+    print(f"temperature: {model.generation_config.temperature}")
+    print(f"top_k: {model.generation_config.top_k}")
+    print(f"top_p: {model.generation_config.top_p}")
+    print(f"use_cache: {model.generation_config.use_cache}")
     print("="*50)
 
 # Ensure model is in eval mode and disable dropout
@@ -245,45 +265,20 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
         
         hook = model.model.layers[layer_to_ablate].register_forward_hook(ablation_hook)
 
-    # Create deterministic generation config - explicitly override ALL defaults
-    generation_config = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        do_sample=False,  # Force deterministic generation
-        temperature=None,  # Not used when do_sample=False
-        top_p=None,       # Not used when do_sample=False
-        top_k=None,       # Not used when do_sample=False
-        use_cache=False,
-        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
-        repetition_penalty=1.0,
-        length_penalty=1.0,
-        num_beams=1,  # Greedy decoding
-    )
-    
-    # Generate with explicit parameters to avoid warnings
+    # Use the model's updated generation config (which we set to deterministic)
+    # Just override max_new_tokens since we already set the model config
     with torch.no_grad():
         output_ids = model.generate(
             input_ids=inputs['input_ids'],
             attention_mask=inputs['attention_mask'],
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=1.0,  # Will be ignored since do_sample=False
-            top_k=None,
-            top_p=None,
-            use_cache=False,
-            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            num_beams=1,
-            repetition_penalty=1.0,
-            length_penalty=1.0,
-            return_dict_in_generate=False
-        )[0]
+            # No need to specify other params since we updated model.generation_config
+        )
 
     if hook: 
         hook.remove()
 
-    decoded = tokenizer.decode(output_ids, skip_special_tokens=True)
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     return decoded
 
 # === Get sentence embedding ===
