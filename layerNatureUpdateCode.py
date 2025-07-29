@@ -212,7 +212,6 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
         use_cache=False,
         temperature=1.0,
         top_p=1.0,
-        top_k=0,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
