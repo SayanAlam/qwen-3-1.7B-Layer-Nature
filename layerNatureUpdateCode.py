@@ -188,9 +188,12 @@ reasoning_prompts = [
     "Find the number of trailing zeros in 100!",
 ]
 
+reasoning_prompts=reasoning_prompts[:10]
+instruction_prompts=instruction_prompts[:10]
+
 # === Get model output tokens ===
 @torch.no_grad()
-def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=1024):
+def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     if layer_to_ablate is not None:
         def ablation_hook(module, input, output):
@@ -205,8 +208,15 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=1024):
     generation_config = GenerationConfig(
     max_new_tokens=max_new_tokens,
     do_sample=False,
+    temperature=1.0,
+    top_k=0,
+    top_p=1.0,
     use_cache=False,
+    pad_token_id=tokenizer.pad_token_id,
+    bos_token_id=tokenizer.bos_token_id,
+    eos_token_id=tokenizer.eos_token_id,
 )
+
 
     output_ids = model.generate(
         **inputs,
@@ -221,7 +231,7 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=1024):
 
 # === Get sentence embedding ===
 def get_embedding(text):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(model.device)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=30).to(model.device)
     with torch.no_grad():
         outputs = model(**inputs, output_hidden_states=True)
     return outputs.hidden_states[-1][:, -1, :].squeeze().float()
@@ -231,7 +241,7 @@ def cosine_similarity(a, b):
     return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
 
 # === Layer-wise Analysis ===
-def analyze_layer_behavior(prompt_set, label, max_new_tokens=1024):
+def analyze_layer_behavior(prompt_set, label, max_new_tokens=30):
     num_layers = len(model.model.layers)
     impact_scores = []
 
@@ -255,8 +265,8 @@ def analyze_layer_behavior(prompt_set, label, max_new_tokens=1024):
     return impact_scores
 
 # === Run for both categories ===
-instruction_scores = analyze_layer_behavior(instruction_prompts, "Instruction", max_new_tokens=1024)
-reasoning_scores = analyze_layer_behavior(reasoning_prompts, "Reasoning", max_new_tokens=1024)
+instruction_scores = analyze_layer_behavior(instruction_prompts, "Instruction", max_new_tokens=30)
+reasoning_scores = analyze_layer_behavior(reasoning_prompts, "Reasoning", max_new_tokens=30)
 
 # === Create output table ===
 layer_ids = list(range(len(instruction_scores)))
