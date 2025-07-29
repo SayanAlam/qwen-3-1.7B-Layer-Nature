@@ -245,12 +245,10 @@ reasoning_prompts = [
     "Find the number of trailing zeros in 100!",
 ]
 
-reasoning_prompts=reasoning_prompts[:5]
-instruction_prompts=instruction_prompts[:5]
 
 # === Get model output tokens ===
 @torch.no_grad()
-def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
+def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=1024):
     # Clear cache before each generation
     torch.cuda.empty_cache()
     
@@ -320,7 +318,7 @@ def cosine_similarity(a, b):
     return torch.nn.functional.cosine_similarity(a_norm, b_norm, dim=0).item()
 
 # === Layer-wise Analysis with multiple runs for stability ===
-def analyze_layer_behavior(prompt_set, label, max_new_tokens=30, num_runs=3):
+def analyze_layer_behavior(prompt_set, label, max_new_tokens=1024, num_runs=3):
     num_layers = len(model.model.layers)
     impact_scores = []
 
@@ -385,7 +383,7 @@ def test_deterministic_generation():
     outputs = []
     for i in range(3):
         set_seed(42)  # Same seed each time
-        output = generate_tokens(test_prompt, max_new_tokens=10)
+        output = generate_tokens(test_prompt, max_new_tokens=1024)
         outputs.append(output)
         print(f"Generation {i+1}: {output}")
     
@@ -404,10 +402,10 @@ def test_deterministic_generation():
 # === Main execution ===
 print("Starting analysis...")
 print("Analyzing instruction prompts...")
-instruction_scores = analyze_layer_behavior(instruction_prompts, "Instruction", max_new_tokens=30)
+instruction_scores = analyze_layer_behavior(instruction_prompts, "Instruction", max_new_tokens=1024)
 
 print("\nAnalyzing reasoning prompts...")
-reasoning_scores = analyze_layer_behavior(reasoning_prompts, "Reasoning", max_new_tokens=30)
+reasoning_scores = analyze_layer_behavior(reasoning_prompts, "Reasoning", max_new_tokens=1024)
 
 # === Create output table ===
 layer_ids = list(range(len(instruction_scores)))
