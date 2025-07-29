@@ -15,8 +15,6 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.eval()
 
-model.generation_config = model.generation_config.from_model_config(model.config)
-
 # === Prompt Sets ===
 instruction_prompts = [
     "Write a poem about how I am missing my classes. The poem must have 4 sections marked with SECTION X. Finish the poem with this exact phrase: \"Can I get my money back for the classes I missed?\"",
@@ -212,11 +210,6 @@ def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=30):
         max_new_tokens=max_new_tokens,
         do_sample=False,
         use_cache=False,
-        temperature=1.0,
-        top_p=1.0,
-        pad_token_id=tokenizer.pad_token_id,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
     )[0]
 
 
