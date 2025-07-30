@@ -1,3 +1,5 @@
+
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import numpy as np
@@ -242,7 +244,8 @@ with torch.no_grad():
     # Apply hooks for the reasoning task
     reasoning_hooks = apply_hooks(model, activations_list_reasoning)
     
-    inputs_reasoning = tokenizer(prompt_reasoning, return_tensors="pt").to(model.device)
+    # --- FIX --- Add padding=True and truncation=True
+    inputs_reasoning = tokenizer(prompt_reasoning, return_tensors="pt", padding=True, truncation=True).to(model.device)
     _ = model(**inputs_reasoning)
     
     # Remove the hooks to clean up
@@ -254,7 +257,8 @@ with torch.no_grad():
     # Apply hooks for the instruction-following task
     instruction_hooks = apply_hooks(model, activations_list_instruction)
     
-    inputs_instruction = tokenizer(prompt_instruction, return_tensors="pt").to(model.device)
+    # --- FIX --- Add padding=True and truncation=True
+    inputs_instruction = tokenizer(prompt_instruction, return_tensors="pt", padding=True, truncation=True).to(model.device)
     _ = model(**inputs_instruction)
     
     # Remove the hooks
