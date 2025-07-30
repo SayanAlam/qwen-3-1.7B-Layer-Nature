@@ -1,6 +1,5 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import matplotlib.pyplot as plt
 import numpy as np
 
 # 1. Load the model and tokenizer
@@ -262,43 +261,33 @@ with torch.no_grad():
     remove_hooks(instruction_hooks)
 
 # 5. Convert lists of tensors to NumPy arrays
-# We need to stack the tensors along a new dimension (the layer dimension)
 try:
+    # Stack tensors and convert to NumPy array
     activations_reasoning = torch.stack(activations_list_reasoning).numpy()
     activations_instruction = torch.stack(activations_list_instruction).numpy()
     
-    print("\n--- Data successfully converted to NumPy arrays. ---")
-    print("Shape of reasoning activations array:", activations_reasoning.shape)
-    print("Shape of instruction activations array:", activations_instruction.shape)
+    print("\n--- Data successfully collected and converted to NumPy arrays. ---")
     
 except Exception as e:
     print(f"\nError converting to NumPy arrays: {e}")
     print("This might happen if the tokenization results in different sequence lengths.")
-    print("You might need to pad the sequences or adjust your analysis.")
-    # For now, we'll just proceed with the original lists for the analysis.
-    activations_reasoning = activations_list_reasoning
-    activations_instruction = activations_list_instruction
+    exit()
 
-# 6. Analysis and Visualization (using the NumPy arrays)
+# 6. Analysis: Calculate L2 norms and Cosine Similarities
 num_layers = len(model.model.layers)
 layer_indices = range(num_layers)
 
-# Calculate L2 norms for each task using the numpy arrays
-# We'll take the norm of the last token's activation for simplicity,
-# or you could take the mean norm across all tokens.
+# Calculate L2 norms for the last token of each sequence
 norms_reasoning = [np.linalg.norm(activations_reasoning[i, -1, :]) for i in layer_indices]
 norms_instruction = [np.linalg.norm(activations_instruction[i, -1, :]) for i in layer_indices]
 
 # Calculate Cosine Similarities
 cosine_similarities = []
-# Ensure the dimensions match before computing similarity
 if activations_reasoning.shape == activations_instruction.shape:
     for i in layer_indices:
-        # Get the activation vectors for the last token of each sequence
         vec_reasoning = activations_reasoning[i, -1, :]
         vec_instruction = activations_instruction[i, -1, :]
         
-        # Compute cosine similarity using numpy's dot product
         dot_product = np.dot(vec_reasoning, vec_instruction)
         norm_reasoning = np.linalg.norm(vec_reasoning)
         norm_instruction = np.linalg.norm(vec_instruction)
@@ -314,27 +303,30 @@ else:
     print("Instruction shape:", activations_instruction.shape)
     cosine_similarities = [0] * num_layers
 
-# 7. Visualization
-plt.figure(figsize=(12, 6))
-plt.plot(layer_indices, norms_reasoning, label="Reasoning Task (L2 Norm)", marker='o')
-plt.plot(layer_indices, norms_instruction, label="Instruction-Following Task (L2 Norm)", marker='x')
-plt.title("Layer Activation Norms for Reasoning vs. Instruction-Following Tasks")
-plt.xlabel("Layer Index")
-plt.ylabel("L2 Norm of Activations")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-plt.figure(figsize=(12, 6))
-plt.plot(layer_indices, cosine_similarities, label="Cosine Similarity", marker='o', color='green')
-plt.title("Cosine Similarity Between Reasoning and Instruction-Following Activations")
-plt.xlabel("Layer Index")
-plt.ylabel("Cosine Similarity")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-print("\n--- Analysis Summary ---")
+# 7. Print the final output
+print("\n" + "="*50)
+print("              LAYER NATURE ANALYSIS RESULTS")
+print("="*50)
 print(f"Number of layers analyzed: {num_layers}")
-print(f"Reasoning Task Prompt: {prompt_reasoning}")
-print(f"Instruction-Following Task Prompt: {prompt_instruction}")
+print(f"\nReasoning Task Prompt: \"{prompt_reasoning}\"")
+print(f"Instruction-Following Task Prompt: \"{prompt_instruction}\"")
+print("="*50)
+
+print("\n--- L2 Norms of Activations (Last Token) ---")
+print("These values indicate the magnitude of the activation vector for each layer.")
+print("Layer | Reasoning Norm | Instruction Norm")
+print("-" * 45)
+for i in layer_indices:
+    print(f"{i:<5} | {norms_reasoning[i]:<14.4f} | {norms_instruction[i]:<16.4f}")
+
+print("\n--- Cosine Similarity Between Task Activations ---")
+print("A value of 1.0 means the vectors are identical in direction.")
+print("A value of 0.0 means they are orthogonal (uncorrelated).")
+print("Layer | Cosine Similarity")
+print("-" * 28)
+for i in layer_indices:
+    print(f"{i:<5} | {cosine_similarities[i]:<16.4f}")
+
+print("\n" + "="*50)
+print("End of Analysis.")
+print("="*50)
