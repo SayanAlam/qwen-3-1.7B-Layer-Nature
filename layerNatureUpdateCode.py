@@ -1,79 +1,58 @@
 import torch
-import torch.nn as nn
-import gc
-import pandas as pd
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import matplotlib.pyplot as plt
 import numpy as np
-import random
-import os
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# === Set seeds for reproducibility ===
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    os.environ['PYTHONHASHSEED'] = str(seed)
+# 1. Load the model and tokenizer
+# Make sure to specify the correct path to your downloaded model
+model_name = "Qwen/Qwen1.5-1.8B"  # Adjust this to your specific model
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+except Exception as e:
+    print(f"Error loading model: {e}. Please ensure the model path is correct and dependencies are installed.")
+    exit()
 
-set_seed(42)
+# If you have a GPU, move the model to it
+if torch.cuda.is_available():
+    model.to("cuda")
+    print("Model moved to GPU.")
+else:
+    print("No GPU available. Running on CPU, which may be slow.")
 
-# === Load local model ===
-model_path = "/home/uom/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/0060bc56d46589041c1048efd1a397421b1142b5"
-tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+# 2. Define the hook function and a helper to manage hooks
+def get_activation_hook(activations_list):
+    """
+    Returns a hook function that saves the output of a layer to a list.
+    """
+    def hook_fn(module, input, output):
+        # We save the output of the layer. Detach it from the graph.
+        if isinstance(output, tuple):
+            activations_list.append(output[0].detach().cpu())
+        else:
+            activations_list.append(output.detach().cpu())
+    return hook_fn
 
-# Set pad token if not available
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+def apply_hooks(model, activations_list):
+    """
+    Applies hooks to all transformer layers and returns a list of the hook handles.
+    """
+    hooks = []
+    layers = model.model.layers
+    for i, layer in enumerate(layers):
+        hook = layer.register_forward_hook(get_activation_hook(activations_list))
+        hooks.append(hook)
+    return hooks
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_path, 
-    trust_remote_code=True, 
-    torch_dtype=torch.float16, 
-    device_map="auto"
-)
-model.eval()
+def remove_hooks(hooks):
+    """
+    Removes all the hooks in a list.
+    """
+    for hook in hooks:
+        hook.remove()
 
-# Print original model's default generation config
-print("Original model's default generation config:")
-if hasattr(model, 'generation_config'):
-    print(f"do_sample: {model.generation_config.do_sample}")
-    print(f"temperature: {model.generation_config.temperature}")
-    print(f"top_k: {model.generation_config.top_k}")
-    print(f"top_p: {model.generation_config.top_p}")
-    print(f"bos_token_id: {model.generation_config.bos_token_id}")
-
-# Override model's generation config for deterministic behavior
-print("\nOverriding model's generation config for deterministic behavior...")
-if hasattr(model, 'generation_config'):
-    model.generation_config.do_sample = False
-    model.generation_config.temperature = 1.0
-    model.generation_config.top_k = None
-    model.generation_config.top_p = None
-    model.generation_config.use_cache = False
-    model.generation_config.repetition_penalty = 1.0
-    model.generation_config.length_penalty = 1.0
-    model.generation_config.num_beams = 1
-
-print("Updated model's generation config:")
-if hasattr(model, 'generation_config'):
-    print(f"do_sample: {model.generation_config.do_sample}")
-    print(f"temperature: {model.generation_config.temperature}")
-    print(f"top_k: {model.generation_config.top_k}")
-    print(f"top_p: {model.generation_config.top_p}")
-    print(f"use_cache: {model.generation_config.use_cache}")
-    print("="*50)
-
-# Ensure model is in eval mode and disable dropout
-for module in model.modules():
-    if hasattr(module, 'training'):
-        module.training = False
-
-# === Prompt Sets ===
-instruction_prompts = [
+# 3. Define the prompts
+prompt_instruction = [
     "Write a poem about how I am missing my classes. The poem must have 4 sections marked with SECTION X. Finish the poem with this exact phrase: \"Can I get my money back for the classes I missed?\"",
     "Write a blog post with 400 or more words about the benefits of sleeping in a hammock.",
     "Can you help me make an advertisement for a new product? It's a diaper that's designed to be more comfortable for babies and I want the entire output in JSON format.",
@@ -134,7 +113,7 @@ instruction_prompts = [
     "I am planning a trip to Japan, and I would like thee to write an itinerary for my journey in a Shakespearean style. You are not allowed to use any commas in your response.",
 ]
 
-reasoning_prompts = [
+prompt_reasoning = [
     "What is the remainder when 999999 is divided by 8?",
     "Let x and y be real numbers such that x + y = 4 and xy = 1. What is the value of x^3 + y^3?",
     "Let f(x) = ax^2 + bx + c, where a, b, and c are real numbers. Suppose that f(1) = 1, f(2) = 4, and f(3) = 9. What is the value of f(4)?",
@@ -245,220 +224,117 @@ reasoning_prompts = [
     "Find the number of trailing zeros in 100!",
 ]
 
+prompt_reasoning=prompt_reasoning[:5]
+prompt_instruction=prompt_instruction[:5]
 
-# === Get model output tokens ===
-@torch.no_grad()
-def generate_tokens(prompt, layer_to_ablate=None, max_new_tokens=1024):
-    # Clear cache before each generation
-    torch.cuda.empty_cache()
+# Use separate lists to store the activations for each task
+activations_list_reasoning = []
+activations_list_instruction = []
+
+# Set model to evaluation mode
+model.eval()
+
+# 4. Run inference for each task and collect activations
+with torch.no_grad():
     
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    # --- Task 1: Reasoning ---
+    print("\n--- Running Reasoning Task ---")
     
-    hook = None
-    if layer_to_ablate is not None:
-        def ablation_hook(module, input, output):
-            if isinstance(output, tuple):
-                return tuple(torch.zeros_like(o) for o in output)
-            return torch.zeros_like(output)
+    # Apply hooks for the reasoning task
+    reasoning_hooks = apply_hooks(model, activations_list_reasoning)
+    
+    inputs_reasoning = tokenizer(prompt_reasoning, return_tensors="pt").to(model.device)
+    _ = model(**inputs_reasoning)
+    
+    # Remove the hooks to clean up
+    remove_hooks(reasoning_hooks)
+    
+    # --- Task 2: Instruction-Following ---
+    print("--- Running Instruction-Following Task ---")
+    
+    # Apply hooks for the instruction-following task
+    instruction_hooks = apply_hooks(model, activations_list_instruction)
+    
+    inputs_instruction = tokenizer(prompt_instruction, return_tensors="pt").to(model.device)
+    _ = model(**inputs_instruction)
+    
+    # Remove the hooks
+    remove_hooks(instruction_hooks)
+
+# 5. Convert lists of tensors to NumPy arrays
+# We need to stack the tensors along a new dimension (the layer dimension)
+try:
+    activations_reasoning = torch.stack(activations_list_reasoning).numpy()
+    activations_instruction = torch.stack(activations_list_instruction).numpy()
+    
+    print("\n--- Data successfully converted to NumPy arrays. ---")
+    print("Shape of reasoning activations array:", activations_reasoning.shape)
+    print("Shape of instruction activations array:", activations_instruction.shape)
+    
+except Exception as e:
+    print(f"\nError converting to NumPy arrays: {e}")
+    print("This might happen if the tokenization results in different sequence lengths.")
+    print("You might need to pad the sequences or adjust your analysis.")
+    # For now, we'll just proceed with the original lists for the analysis.
+    activations_reasoning = activations_list_reasoning
+    activations_instruction = activations_list_instruction
+
+# 6. Analysis and Visualization (using the NumPy arrays)
+num_layers = len(model.model.layers)
+layer_indices = range(num_layers)
+
+# Calculate L2 norms for each task using the numpy arrays
+# We'll take the norm of the last token's activation for simplicity,
+# or you could take the mean norm across all tokens.
+norms_reasoning = [np.linalg.norm(activations_reasoning[i, -1, :]) for i in layer_indices]
+norms_instruction = [np.linalg.norm(activations_instruction[i, -1, :]) for i in layer_indices]
+
+# Calculate Cosine Similarities
+cosine_similarities = []
+# Ensure the dimensions match before computing similarity
+if activations_reasoning.shape == activations_instruction.shape:
+    for i in layer_indices:
+        # Get the activation vectors for the last token of each sequence
+        vec_reasoning = activations_reasoning[i, -1, :]
+        vec_instruction = activations_instruction[i, -1, :]
         
-        hook = model.model.layers[layer_to_ablate].register_forward_hook(ablation_hook)
-
-    # VERIFY: Print generation config being used (only for first call)
-    if not hasattr(generate_tokens, '_config_verified'):
-        print(f"\nVERIFYING GENERATION CONFIG:")
-        print(f"Model config - do_sample: {model.generation_config.do_sample}")
-        print(f"Model config - temperature: {model.generation_config.temperature}")
-        print(f"Model config - use_cache: {model.generation_config.use_cache}")
-        generate_tokens._config_verified = True
-
-    # Force deterministic parameters explicitly in the generate call
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask'],
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # EXPLICITLY FORCE THIS
-            temperature=1.0,
-            top_k=None,
-            top_p=None,
-            use_cache=False,
-            num_beams=1,
-            early_stopping=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-    if hook: 
-        hook.remove()
-
-    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    return decoded
-
-# === Get sentence embedding ===
-@torch.no_grad()
-def get_embedding(text):
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(model.device)
-    
-    with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=True, use_cache=False)
-    
-    # Use mean pooling instead of last token for more stable embeddings
-    hidden_states = outputs.hidden_states[-1]
-    attention_mask = inputs['attention_mask'].unsqueeze(-1)
-    masked_embeddings = hidden_states * attention_mask
-    embeddings = masked_embeddings.sum(dim=1) / attention_mask.sum(dim=1)
-    
-    return embeddings.squeeze().float()
-
-# === Cosine similarity between outputs ===
-def cosine_similarity(a, b):
-    # Normalize vectors to avoid numerical issues
-    a_norm = torch.nn.functional.normalize(a, p=2, dim=0)
-    b_norm = torch.nn.functional.normalize(b, p=2, dim=0)
-    return torch.nn.functional.cosine_similarity(a_norm, b_norm, dim=0).item()
-
-# === Layer-wise Analysis with multiple runs for stability ===
-def analyze_layer_behavior(prompt_set, label, max_new_tokens=1024, num_runs=3):
-    num_layers = len(model.model.layers)
-    impact_scores = []
-
-    for layer in tqdm(range(num_layers), desc=f"{label} Layer Ablation"):
-        run_scores = []
+        # Compute cosine similarity using numpy's dot product
+        dot_product = np.dot(vec_reasoning, vec_instruction)
+        norm_reasoning = np.linalg.norm(vec_reasoning)
+        norm_instruction = np.linalg.norm(vec_instruction)
         
-        # Multiple runs for each layer to get more stable results
-        for run in range(num_runs):
-            set_seed(42 + run)  # Different seed for each run
-            delta_total = 0
-            
-            for i, prompt in enumerate(prompt_set):
-                # Generate original and ablated outputs
-                original = generate_tokens(prompt, None, max_new_tokens)
-                ablated = generate_tokens(prompt, layer_to_ablate=layer, max_new_tokens=max_new_tokens)
+        if norm_reasoning > 0 and norm_instruction > 0:
+            cos_sim = dot_product / (norm_reasoning * norm_instruction)
+            cosine_similarities.append(cos_sim)
+        else:
+            cosine_similarities.append(0.0)
+else:
+    print("\nCannot compute cosine similarity directly due to mismatched array shapes.")
+    print("Reasoning shape:", activations_reasoning.shape)
+    print("Instruction shape:", activations_instruction.shape)
+    cosine_similarities = [0] * num_layers
 
-                # Debug: Print first few examples for layer 0 and a middle layer
-                if layer in [0, num_layers//2] and run == 0 and i == 0:
-                    print(f"\n--- DEBUG: Layer {layer}, Prompt {i+1} ---")
-                    print(f"Original: {original[:100]}...")
-                    print(f"Ablated:  {ablated[:100]}...")
+# 7. Visualization
+plt.figure(figsize=(12, 6))
+plt.plot(layer_indices, norms_reasoning, label="Reasoning Task (L2 Norm)", marker='o')
+plt.plot(layer_indices, norms_instruction, label="Instruction-Following Task (L2 Norm)", marker='x')
+plt.title("Layer Activation Norms for Reasoning vs. Instruction-Following Tasks")
+plt.xlabel("Layer Index")
+plt.ylabel("L2 Norm of Activations")
+plt.legend()
+plt.grid(True)
+plt.show()
 
-                # Get embeddings
-                orig_emb = get_embedding(original)
-                ablt_emb = get_embedding(ablated)
-                
-                # Calculate dissimilarity
-                similarity = cosine_similarity(orig_emb, ablt_emb)
-                delta = 1 - similarity
-                delta_total += delta
-                
-                # Debug: Print similarity for first prompt
-                if layer in [0, num_layers//2] and run == 0 and i == 0:
-                    print(f"Similarity: {similarity:.4f}, Delta: {delta:.4f}")
+plt.figure(figsize=(12, 6))
+plt.plot(layer_indices, cosine_similarities, label="Cosine Similarity", marker='o', color='green')
+plt.title("Cosine Similarity Between Reasoning and Instruction-Following Activations")
+plt.xlabel("Layer Index")
+plt.ylabel("Cosine Similarity")
+plt.legend()
+plt.grid(True)
+plt.show()
 
-            avg_delta = delta_total / len(prompt_set)
-            run_scores.append(avg_delta)
-            
-            # Clean up after each run
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        # Take median across runs for stability
-        final_score = np.median(run_scores)
-        impact_scores.append(final_score)
-        
-        print(f"Layer {layer}: {final_score:.4f} (std: {np.std(run_scores):.4f}) - Range: [{min(run_scores):.4f}, {max(run_scores):.4f}]")
-
-    return impact_scores
-
-# === Test deterministic behavior ===
-def test_deterministic_generation():
-    print("\n" + "="*60)
-    print("TESTING DETERMINISTIC BEHAVIOR")
-    print("="*60)
-    
-    test_prompt = "The capital of France is"
-    print(f"Test prompt: '{test_prompt}'")
-    print("\nGenerating same prompt 3 times to verify determinism:")
-    
-    # Set seed and generate multiple times
-    outputs = []
-    for i in range(3):
-        set_seed(42)  # Same seed each time
-        output = generate_tokens(test_prompt, max_new_tokens=1024)
-        outputs.append(output)
-        print(f"Generation {i+1}: {output}")
-    
-    # Check if all outputs are identical
-    all_same = all(output == outputs[0] for output in outputs)
-    print(f"\nAll outputs identical: {all_same}")
-    
-    if not all_same:
-        print("❌ WARNING: Generation is NOT deterministic!")
-        print("This will cause inconsistent layer analysis results.")
-    else:
-        print("✅ Generation is deterministic - good!")
-    
-    print("="*60)
-
-# === Main execution ===
-print("Starting analysis...")
-print("Analyzing instruction prompts...")
-instruction_scores = analyze_layer_behavior(instruction_prompts, "Instruction", max_new_tokens=1024)
-
-print("\nAnalyzing reasoning prompts...")
-reasoning_scores = analyze_layer_behavior(reasoning_prompts, "Reasoning", max_new_tokens=1024)
-
-# === Create output table ===
-layer_ids = list(range(len(instruction_scores)))
-
-# Calculate statistics for better threshold setting
-instr_mean = np.mean(instruction_scores)
-reason_mean = np.mean(reasoning_scores)
-diff_scores = [r - i for r, i in zip(reasoning_scores, instruction_scores)]
-diff_std = np.std(diff_scores)
-diff_mean = np.mean(diff_scores)
-
-print(f"\nStatistics:")
-print(f"Instruction Impact - Mean: {instr_mean:.4f}, Std: {np.std(instruction_scores):.4f}")
-print(f"Reasoning Impact - Mean: {reason_mean:.4f}, Std: {np.std(reasoning_scores):.4f}")
-print(f"Difference (R-I) - Mean: {diff_mean:.4f}, Std: {diff_std:.4f}")
-print(f"Suggested threshold: {diff_std:.4f} (1 std dev)")
-
-# Use adaptive threshold based on standard deviation
-adaptive_threshold = max(0.01, diff_std * 0.5)  # At least 0.01, or half std dev
-print(f"Using threshold: {adaptive_threshold:.4f}")
-
-df = pd.DataFrame({
-    "Layer": layer_ids,
-    "Instruction_Impact": instruction_scores,
-    "Reasoning_Impact": reasoning_scores,
-    "Δ (Reason - Instr)": diff_scores,
-    "Layer_Nature": [
-        "Reasoning" if r - i > adaptive_threshold else "Instruction" if i - r > adaptive_threshold else "Neutral"
-        for i, r in zip(instruction_scores, reasoning_scores)
-    ]
-})
-
-# === Format and show ===
-df["Instruction_Impact"] = df["Instruction_Impact"].round(4)
-df["Reasoning_Impact"] = df["Reasoning_Impact"].round(4)
-df["Δ (Reason - Instr)"] = df["Δ (Reason - Instr)"].round(4)
-
-print("\n" + "="*80)
-print("FINAL RESULTS")
-print("="*80)
-print(df.to_string(index=False))
-
-# === Save to files ===
-df.to_csv("layer_behavior_analysis.csv", index=False)
-with open("layer_behavior_table.txt", "w") as f:
-    f.write("Qwen 3 1.7B Layer Analysis Results\n")
-    f.write("="*50 + "\n\n")
-    f.write(df.to_string(index=False))
-    f.write("\n\nAnalysis Summary:\n")
-    f.write(f"Total layers: {len(instruction_scores)}\n")
-    f.write(f"Reasoning-dominant layers: {sum(1 for x in df['Layer_Nature'] if x == 'Reasoning')}\n")
-    f.write(f"Instruction-dominant layers: {sum(1 for x in df['Layer_Nature'] if x == 'Instruction')}\n")
-    f.write(f"Neutral layers: {sum(1 for x in df['Layer_Nature'] if x == 'Neutral')}\n")
-
-print(f"\nResults saved to 'layer_behavior_analysis.csv' and 'layer_behavior_table.txt'")
-
+print("\n--- Analysis Summary ---")
+print(f"Number of layers analyzed: {num_layers}")
+print(f"Reasoning Task Prompt: {prompt_reasoning}")
+print(f"Instruction-Following Task Prompt: {prompt_instruction}")
